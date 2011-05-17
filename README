@@ -18,6 +18,8 @@ or
 
   git-p4 clone //depot/path/project myproject
 
+Note for clarity: depot does not include the p4 server name...
+
 This will create an empty git repository in a subdirectory called "project" (or
 "myproject" with the second command), import the head revision from the
 specified perforce path into a git "p4" branch (remotes/p4 actually), create a
