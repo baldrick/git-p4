@@ -11,8 +11,35 @@
 import optparse, sys, os, marshal, subprocess, shelve
 import tempfile, getopt, os.path, time, platform
 import re
+import cStringIO
+
+from sets import Set;
 
 verbose = False
+
+class LargeFileWriter:
+    """Wrapper for a file, to get around a windows bug when writing large amounts of data.
+    
+    When writing to the wrapped file object, writes are broken up so that only 10MB are written at
+    a time. Otherwise, there is IO exception on Windows.
+    """
+    def __init__(self, filedesc):
+        self.read = filedesc.read
+        self.flush = filedesc.flush
+        self.close = filedesc.close
+        self.filedesc = filedesc
+
+    def write(self, bytes):
+        chunk = 10*1024*1024 # I don't know how high we can go before the bug is triggered, so we
+        #only write 10MB at a time.
+        while len(bytes) > chunk:
+            self.filedesc.write(bytes[:chunk])
+            self.filedesc.flush()
+            bytes = bytes[chunk:]
+
+        if len(bytes):    
+            self.filedesc.write(bytes[:chunk])
+            self.filedesc.flush()
 
 
 def p4_build_cmd(cmd):
@@ -201,7 +228,29 @@ def isModeExec(mode):
 def isModeExecChanged(src_mode, dst_mode):
     return isModeExec(src_mode) != isModeExec(dst_mode)
 
-def p4CmdList(cmd, stdin=None, stdin_mode='w+b', cb=None):
+# Some commands (eg. p4 print the entire repository) can result in gigabytes of
+# data. In order to handle this without running out of memory, we have to
+# process these items in batches of maybe 100 at a time. The P4CmdReader class
+# handles this chunking of data.
+class P4CmdReader:
+    def __init__(self, cmd, stdin):
+        self.MAX_CHUNKS = 100
+        self.p4 = p4CmdListOpen(cmd, stdin)
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        try:
+            return marshal.load(self.p4.stdout)
+        except IOError, e:
+            print "IOError while reading marshaller: %s" % repr(e)
+            print e.strerror
+            raise
+        except EOFError:
+            raise StopIteration
+
+def p4CmdListOpen(cmd, stdin=None, stdin_mode='w+b'):
     cmd = p4_build_cmd("-G %s" % (cmd))
     if verbose:
         sys.stderr.write("Opening pipe: %s\n" % cmd)
@@ -216,9 +265,13 @@ def p4CmdList(cmd, stdin=None, stdin_mode='w+b', cb=None):
         stdin_file.flush()
         stdin_file.seek(0)
 
-    p4 = subprocess.Popen(cmd, shell=True,
+    return subprocess.Popen(cmd, shell=True,
                           stdin=stdin_file,
                           stdout=subprocess.PIPE)
+
+def p4CmdList(cmd, stdin=None, stdin_mode='w+b', cb=None):
+
+    p4 = p4CmdListOpen(cmd, stdin, stdin_mode)
 
     result = []
     try:
@@ -252,16 +305,22 @@ def p4Where(depotPath):
     outputList = p4CmdList("where %s" % depotPath)
     output = None
     for entry in outputList:
+        print repr(entry)
+        print "depotPath:" + depotPath
         if "depotFile" in entry:
             if entry["depotFile"] == depotPath:
                 output = entry
+                print "found1"
                 break
         elif "data" in entry:
             data = entry.get("data")
             space = data.find(" ")
             if data[:space] == depotPath:
                 output = entry
+                print "found2"
                 break
+        else:
+            print "not found"
     if output == None:
         return ""
     if output["code"] == "error":
@@ -556,6 +615,139 @@ class P4RollBack(Command):
 
         return True
 
+class P4FileReader:
+    Bytes = 0
+    LastFile = ''
+    LastBytes = 0
+    def __init__(self, files, clientSpecDirs):
+        # Initialize P4FileReader object with a list of files to read. This
+        # takes into account the clientSpecDirs passed in.
+        # Each element of files is a dictionary with the following
+        # elements:
+        #
+        # path: The complete path to the file in the depot, starting from "//"
+        # action: The action to take. Eg: 'delete' 'purge'
+
+        # list of files to commit.
+        self.filesForCommit = []
+
+        # list of files to read, filtered according to the client spec.
+        self.filesToRead = []
+
+        # mapping from path to file record.
+        self.pathMap = {}
+
+        self.filesRead = 0
+
+        self.filterClientSpec( files, clientSpecDirs )
+
+        self.reader = P4CmdReader('-x - print',
+                             stdin='\n'.join(['%s#%s' % (f['path'], f['rev'])
+                                              for f in self.filesToRead]) )
+
+        # leftover record from previous time next() was called.
+        self.leftover = None                                      
+
+    def filterClientSpec( self, files, clientSpecDirs ):
+        # sets filesForCommit and filesToRead, filtered according to the client spec.
+        for f in files:
+            includeFile = False
+            excludeFile = False
+            if len(clientSpecDirs):
+                for val in clientSpecDirs:
+                    if f['path'].startswith(val[0]):
+                        if val[1] > 0:
+                            includeFile = True
+                        else:
+                            excludeFile = True
+            else:
+                includeFile = True
+
+            if includeFile and not excludeFile:
+                self.filesForCommit.append(f)
+                self.pathMap[f['path']] = f
+                if f['action'] not in ('delete', 'purge'):
+                    self.filesToRead.append(f)
+
+    def printStatus(self, filename):
+        if filename == self.LastFile and self.Bytes - self.LastBytes < 100*1024: return
+        self.LastFile = filename
+        self.LastBytes = self.Bytes
+        if len(filename) <= 60:
+            line = filename + " " * (63-len(filename))
+        else:
+            line = "..." + filename[len(filename)-60:]
+
+        print "%s | %.1f MB (%d/%d files)\r" % (line,
+            float(self.Bytes) / (1024*1024), self.filesRead + 1,
+            len(self.filesToRead)),
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        # Return a record containing a file to commit. 
+        #
+        # Perforce outputs a number of records for each file. The first one
+        # contains basic information such as the change list and filename. This
+        # is followed by a number of records containing only "code" and "data"
+        # fields, which are the file data broken apart.
+
+        # while perforce keeps giving us files we didn't ask for,
+        # (Shouldn't ever happen, but handle it anyway)
+        while 1:
+            textBuffer = cStringIO.StringIO()
+
+            if self.leftover:
+                header = self.leftover
+                self.leftover = None
+            else:    
+                try:
+                    header = self.reader.next()
+                except StopIteration:    
+                    print "" # newline for status information
+                    raise
+
+            # now we have the header record.
+            if not header.has_key('depotFile'):
+                die("p4 print fails with: %s\n" % repr(header))
+
+            self.printStatus(header['depotFile'])
+
+            for record in self.reader:
+                if record['code'] in ( 'text', 'unicode', 'binary' ):   
+                    # encountered subsequent data chunk. Append to file data.
+                    textBuffer.write( record['data'] )
+                    self.Bytes += len(record['data'])
+                    del record['data']
+                    self.printStatus(header['depotFile'])
+                else:
+                    # encountered the next header.
+                    # store for processing next time.
+                    self.leftover = record
+                    break
+
+            text = textBuffer.getvalue()
+            textBuffer.close()
+
+            if header['type'] in ('text+ko', 'unicode+ko', 'binary+ko'):
+                text = re.sub(r'(?i)\$(Id|Header):[^$]*\$',r'$\1$', text)
+            elif header['type'] in ('text+k', 'ktext', 'kxtext', 'unicode+k', 'binary+k'):
+                text = re.sub(r'\$(Id|Header|Author|Date|DateTime|Change|File|Revision):[^$\n]*\$',r'$\1$', text)
+
+            file = None
+            filePath = header['depotFile']
+            if filePath in self.pathMap:
+                file = self.pathMap[filePath]
+                file['data'] = text
+                self.filesRead += 1
+                return file
+            else:
+                # perforce gave us something we didn't ask for?
+                print "Bad path: %s" % filePath
+                continue
+            
+
 class P4Submit(Command):
     def __init__(self):
         Command.__init__(self)
@@ -777,6 +969,9 @@ class P4Submit(Command):
             tmpFile.write(submitTemplate + separatorLine + diff + newdiff)
             tmpFile.close()
             mtime = os.stat(fileName).st_mtime
+            defaultEditor = "vi"
+            if platform.system() == "Windows":
+                defaultEditor = "notepad"
             if os.environ.has_key("P4EDITOR"):
                 editor = os.environ.get("P4EDITOR")
             else:
@@ -1191,7 +1386,34 @@ class P4Sync(Command):
                 print "parent %s" % parent
             self.gitStream.write("from %s\n" % parent)
 
-        self.streamP4Files(new_files)
+        for file in P4FileReader( new_files, self.clientSpecDirs ):
+            if file["type"] == "apple":
+                print "\nfile %s is a strange apple file that forks. Ignoring!" % file['path']
+                continue
+
+            relPath = self.stripRepoPath(file['path'], branchPrefixes)
+            if file["action"] in ("delete", "purge"):
+                self.gitStream.write("D %s\n" % relPath)
+            else:
+                data = file['data']
+                del file['data']
+
+                mode = "644"
+                if isP4Exec(file["type"]):
+                    mode = "755"
+                elif file["type"] == "symlink":
+                    mode = "120000"
+                    # p4 print on a symlink contains "target\n", so strip it off
+                    data = data[:-1]
+
+                if self.isWindows and file["type"].endswith("text"):
+                    data = data.replace("\r\n", "\n")
+
+                self.gitStream.write("M %s inline %s\n" % (mode, relPath))
+                self.gitStream.write("data %s\n" % len(data))
+                self.gitStream.write(data)
+                self.gitStream.write("\n")
+
         self.gitStream.write("\n")
 
         change = int(details["change"])
@@ -1764,7 +1986,7 @@ class P4Sync(Command):
                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE);
         self.gitOutput = importProcess.stdout
-        self.gitStream = importProcess.stdin
+        self.gitStream = LargeFileWriter(importProcess.stdin)
         self.gitError = importProcess.stderr
 
         if revision:
