@@ -1149,9 +1149,12 @@ class P4Sync(Command):
                 self.streamOneP4File(self.stream_file, self.stream_contents)
 
     def commit(self, details, files, branch, branchPrefixes, parent = ""):
+        if "time" not in details:
+            print details
+
         epoch = details["time"]
         author = details["user"]
-	self.branchPrefixes = branchPrefixes
+        self.branchPrefixes = branchPrefixes
 
         if self.verbose:
             print "commit into %s" % branch
